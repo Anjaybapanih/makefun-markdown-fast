@@ -267,9 +267,16 @@ function lineRest(ln) {
   return ln.text.slice(ln.pos);
 }
 // Number of leading whitespace columns (spaces/tabs) at the cursor.
+// A partially consumed tab contributes only its remainder (partialTab):
+// counting its full width would double-count the part already consumed
+// as a container marker (T6/T9/T10: a tab after '>' is content, and a
+// line starting with its remainder must not look like indented code).
 function lineIndent(ln) {
   let col = ln.col;
   let p = ln.pos;
+  if (ln.partialTab > 0 && p < ln.text.length && ln.text.charCodeAt(p) === 9) {
+    col += ln.partialTab; p++;
+  }
   while (p < ln.text.length) {
     const c = ln.text.charCodeAt(p);
     if (c === 32) { col++; p++; }
@@ -360,6 +367,17 @@ function parseBlocks(src) {
       if (curLine === markersBlankLine + 1 && parent === markersBlankParent && parent.children.length > 1) {
         markersBlankParent._blankSep = true;
       }
+      // a bare ">" line that closed a paragraph directly in a list item,
+      // when the very next line starts a SIBLING item in the same list,
+      // makes the list loose (v1/v4/v5/v7, doc-22): the ">" line is a
+      // blank line at the list's level separating the two items. A bare
+      // ">" inside a nested blockquote (cm-320) never sets
+      // markersBlankParent (the paragraph's parent is the quote, not the
+      // item), so it stays tight.
+      if (curLine === markersBlankLine + 1 && node.t === 'item' && parent.t === 'list' &&
+          parent.children.indexOf(markersBlankParent) !== -1) {
+        markersBlankParent._blankSep = true;
+      }
       if (curLine > markersBlankLine) markersBlankParent = null;
     }
     return node;
@@ -397,27 +415,47 @@ function parseBlocks(src) {
       if (c.t === 'quote') {
         const savePos = ln.pos, saveCol = ln.col, savePart = ln.partialTab;
         // skip up to 3 columns of indentation, then expect '>'
+        // (vcol is the column in the frame after outer containers were
+        // stripped — tab widths are computed from it, not the absolute
+        // column: a tab after '>' expands from the marker, so `  >\tX`
+        // in a list item and `>\tX` at top level differ, T6 vs T9.)
         let ok = true;
         let n = 3;
+        let vcol = 0;
         while (n > 0 && ln.pos < ln.text.length) {
           const ch = ln.text.charCodeAt(ln.pos);
-          if (ch === 32) { ln.pos++; ln.col++; n--; }
+          if (ch === 32) { ln.pos++; ln.col++; vcol++; n--; }
           else if (ch === 9) {
-            const w = 4 - (ln.col % 4);
-            if (w <= n) { ln.pos++; ln.col += w; n -= w; }
-            else { ln.partialTab = w - n; ln.col += n; n = 0; }
+            const w = 4 - (vcol % 4);
+            if (w <= n) { ln.pos++; ln.col += w; vcol += w; n -= w; }
+            else { ln.partialTab = w - n; ln.col += n; vcol += n; n = 0; }
           } else break;
         }
         if (ln.pos < ln.text.length && ln.text.charCodeAt(ln.pos) === 62) {
-          ln.pos++; ln.col++;
+          ln.pos++; ln.col++; vcol++;
           // one optional space after '>'; a tab counts as one column here.
           // The space is only consumed when more content follows it: a
           // trailing space is content for the paragraph (cm-241)
           let markerW = 1;
           if (ln.pos < ln.text.length) {
             const ch = ln.text.charCodeAt(ln.pos);
-            if (ch === 32 && ln.pos + 1 < ln.text.length) { ln.pos++; ln.col++; markerW = 2; }
-            else if (ch === 9) { const w = 4 - (ln.col % 4); ln.partialTab = w - 1; ln.col += 1; markerW = 2; }
+            if (ch === 32 && ln.pos + 1 < ln.text.length) {
+              ln.pos++; ln.col++; vcol++; markerW = 2;
+              // a tab right after '> ' is content: it expands from the
+              // marker-relative column (T2/T5/T10 -> 2 spaces, not a
+              // literal tab and not indented code).
+              if (ln.pos < ln.text.length && ln.text.charCodeAt(ln.pos) === 9) {
+                ln.partialTab = 4 - (vcol % 4);
+                vcol += ln.partialTab;
+              }
+            }
+            else if (ch === 9) {
+              const w = 4 - (vcol % 4);
+              ln.partialTab = w - 1; ln.col += 1; vcol += 1; markerW = 2;
+              // fully consumed tab: step past it so lineIndent/lineRest
+              // do not count it again (T6 -> paragraph, not code).
+              if (ln.partialTab === 0) ln.pos++;
+            }
           }
           // the innermost blockquote's own marker width is the TAB base
           ln.innerBase = markerW;
@@ -733,14 +771,24 @@ function parseBlocks(src) {
 
   function tryBlockquote(ln, container) {
     // skip up to 3 columns of indentation (spaces/tabs), then expect '>'
+    // (vcol is the column in the frame after outer containers were
+    // stripped — tab widths are computed from it, not the absolute
+    // column: a tab after '>' expands from the marker, so `  >\tX`
+    // in a list item and `>\tX` at top level differ, T6 vs T9.)
     let n = 3;
-    let p = ln.pos, col = ln.col;
+    let p = ln.pos, col = ln.col, vcol = 0;
     while (n > 0 && p < ln.text.length) {
       const ch = ln.text.charCodeAt(p);
-      if (ch === 32) { p++; col++; n--; }
+      if (ch === 32) { p++; col++; vcol++; n--; }
       else if (ch === 9) {
-        const w = 4 - (col % 4);
-        if (w <= n) { p++; col += w; n -= w; }
+        // A tab partially consumed by an outer container (a list item)
+        // only contributes its remainder (ln.partialTab): the full width
+        // would double-count the part already spent as the container's
+        // indent (u1/u4, doc-25: `\t> not a quote` inside a list item —
+        // the tab's remainder is 1 column, so '>' sits 1 column in and
+        // starts a blockquote, not 4 columns in as a lazy paragraph).
+        const w = (p === ln.pos && ln.partialTab > 0) ? ln.partialTab : 4 - (vcol % 4);
+        if (w <= n) { p++; col += w; vcol += w; n -= w; }
         else break; // partial tab: '>' would sit past 3 columns
       } else break;
     }
@@ -756,10 +804,27 @@ function parseBlocks(src) {
     // space is content for the paragraph (cm-241)
     ln.pos = p + 1;
     ln.col = col + 1;
+    ln.partialTab = 0; // any indent tab (incl. a partial one) is now consumed
+    vcol += 1;
     if (ln.pos < ln.text.length) {
       const ch = ln.text.charCodeAt(ln.pos);
-      if (ch === 32 && ln.pos + 1 < ln.text.length) { ln.pos++; ln.col++; }
-      else if (ch === 9) { const w = 4 - (ln.col % 4); ln.partialTab = w - 1; ln.col += 1; }
+      if (ch === 32 && ln.pos + 1 < ln.text.length) {
+        ln.pos++; ln.col++; vcol++;
+        // a tab right after '> ' is content: it expands from the
+        // marker-relative column (T2/T5/T10 -> 2 spaces, not a
+        // literal tab and not indented code).
+        if (ln.pos < ln.text.length && ln.text.charCodeAt(ln.pos) === 9) {
+          ln.partialTab = 4 - (vcol % 4);
+          vcol += ln.partialTab;
+        }
+      }
+      else if (ch === 9) {
+        const w = 4 - (vcol % 4);
+        ln.partialTab = w - 1; ln.col += 1; vcol += 1;
+        // fully consumed tab: step past it so lineIndent/lineRest do
+        // not count it again (T6 -> paragraph, not code).
+        if (ln.partialTab === 0) ln.pos++;
+      }
     }
     return true;
   }
@@ -993,16 +1058,59 @@ function parseBlocks(src) {
     // A line that does not match the open containers ends an indented
     // code or HTML block living inside them. A fenced code block ends
     // when a BLOCKQUOTE fails to match (the quote — and everything
-    // inside it — is over, cm-128/cm-237), or when the line starts a new
-    // list marker (it opens a sibling list item, doc-21); when only a
-    // list item's indent fails and the line is plain text, it is still
-    // fenced-code content (doc-02: a column-0 line inside a fenced block
-    // in a list item is code, not a new block).
+    // inside it — is over, cm-128/cm-237; every line is checked, D3).
+    // When a LIST ITEM fails to match, the rule is finer (probed on
+    // marked, A–D series): the fence is ANCHORED only once a non-blank
+    // content line has matched the item's indent. Before that, any
+    // failing line ends the fence empty (doc-13's ```sh: first content
+    // line `print(...)` at column 0 -> empty fence; the stranded closing
+    // ```` line then opens an unclosed fence swallowing the rest of the
+    // document, including the link-reference definitions — that is why
+    // no [30]/[large-38]/[18]/[24]/[method-60] reference resolves
+    // there). After anchoring, plain-text lines stay code content at
+    // any indent (doc-02's `````console: `warning useState read` at
+    // column 0 is code), but a fence-run line (```/~~~, >=3 of either
+    // char, optional info string) ends the fence and is reprocessed
+    // outside (D1/D2/D6/D8/D12–D17). A fenced code block at TOP level
+    // has no containers to fail, so a column-0 line inside it stays
+    // code (doc-02's ```css).
     if (!allMatched) {
       const t0 = tip();
-      const endFenced = t0.t === 'code' && t0.fenced &&
-        ((failAt && failAt.t === 'quote') ||
-         (failAt && failAt.t === 'item' && lineStartsListMarker(ln)));
+      let endFenced = false;
+      if (t0.t === 'code' && t0.fenced && failAt) {
+        if (failAt.t === 'quote') endFenced = true;
+        else if (failAt.t === 'item') {
+          // A quote nested BELOW the failing item also fails (containers
+          // are matched outside-in, so failing the item strands the
+          // quote): the line is outside that quote, and a line outside
+          // a quote ends a fence in it (D19, doc-36's `* Pull` line).
+          // A quote ABOVE the failing item does not force an end: a
+          // line inside the quote but outside the item stays code once
+          // anchored (D18).
+          let quoteBelow = false;
+          const fi = open.indexOf(failAt);
+          for (let k = fi + 1; k < open.length; k++) {
+            if (open[k].t === 'quote') { quoteBelow = true; break; }
+          }
+          if (quoteBelow) endFenced = true;
+          else {
+            const anchored = t0.lines.some(l => l !== '');
+            if (!anchored) endFenced = true;
+            else {
+              // a fence-run line (```/~~~, >=3, either char, info allowed)
+              const s = lineRest(ln);
+              let sp = 0;
+              while (sp < 3 && sp < s.length && s.charCodeAt(sp) === 32) sp++;
+              const fc = s.charCodeAt(sp);
+              if (fc === 96 || fc === 126) {
+                let q = sp;
+                while (q < s.length && s.charCodeAt(q) === fc) q++;
+                if (q - sp >= 3) endFenced = true;
+              }
+            }
+          }
+        }
+      }
       if ((t0.t === 'code' && !t0.fenced) || t0.t === 'html' || endFenced) {
         // an HTML block cut off by a line that starts a sibling block has
         // no trailing newline (cm-175)
@@ -1138,6 +1246,13 @@ function parseBlocks(src) {
         if (par && par.t === 'item') { markersBlankParent = par; markersBlankLine = curLine; }
         finalize(open.pop());
       }
+      // A bare marker line that fails to match an inner container closes
+      // that container (t1/t2, doc-33): `>` between two `> >` blocks ends
+      // the inner quote, so the next `> >` opens a NEW inner quote;
+      // without this the inner quote stays open and swallows it as a
+      // second paragraph. When every container matched (t3), nothing
+      // closes — the bare `>` is just a blank line in the quote.
+      if (!allMatched) closeTo(container);
       continue;
     }
     blankBeforeLine = lastLineBlank;
@@ -1148,7 +1263,28 @@ function parseBlocks(src) {
       if (level) {
         const para = tip();
         const extracted = extractRefs(para.lines.join('\n'));
-        if (extracted.text.trim() !== '') {
+        // a paragraph that is already a table (header + delimiter row)
+        // keeps swallowing lines as rows: a setext-looking line is
+        // just another row, never a heading underline (doc-26:
+        // '=========' after 'Foo *bar*' is a table row; the table
+        // only ends at a truly blank line). Same conditions as the
+        // table check in finalizeParagraph.
+        const tlines = extracted.text.split('\n');
+        let tf = 0;
+        while (tf < tlines.length && tlines[tf].trim() === '') tf++;
+        const tcont = tlines.slice(tf);
+        let isTable = false;
+        if (tcont.length >= 2) {
+          const dc = parseDelimiterRow(tcont[1]);
+          if (dc) {
+            const hc = splitTableCells(tcont[0]);
+            isTable = hc.length === dc.length &&
+              (tcont[0].indexOf('|') !== -1 || dc.length > 1);
+          }
+        }
+        if (isTable) {
+          // fall through: the line is a plain continuation (a row)
+        } else if (extracted.text.trim() !== '') {
           open.pop();
           // a setext heading's text is the paragraph's text with leading and
           // trailing whitespace stripped
@@ -1308,6 +1444,7 @@ function parseInline(s, refs) {
       let oi = ci - 1;
       let opener = null;
       let shadowed = false;
+      let oddShadowed = false;
       while (oi >= 0) {
         const o = delims[oi];
         // A strong closer that stayed behind (see below) bars a later
@@ -1315,6 +1452,10 @@ function parseInline(s, refs) {
         // earlier opener; a two-delimiter (strong) match may still form
         // past it, so keep searching instead of failing outright.
         if (o.ch === closer.ch && o.blocking) { shadowed = true; oi--; continue; }
+        // An odd-block left by a both-open-and-close closer consumed
+        // earlier (see below): same shape, but it only bars the match
+        // when the two lengths sum to a multiple of 3.
+        if (o.ch === closer.ch && o.oddBlocking) { oddShadowed = true; oi--; continue; }
         // Odd-match rule: if either delimiter can both open and close,
         // the sum of the lengths must not be a multiple of 3, unless both
         // lengths are multiples of 3 (cm-416, cm-417).
@@ -1332,8 +1473,20 @@ function parseInline(s, refs) {
         }
         if (o.active && o.ch === closer.ch && o.canOpen && !blocked) {
           // past a blocking closer, only a strong (two-delimiter) match
-          // may still form; a one-delimiter match is barred
-          if (shadowed && !(o.len >= 2 && closer.len >= 2)) { oi--; continue; }
+          // may still form; a one-delimiter match is barred. The odd-block
+          // bars it only when the two lengths sum to a multiple of 3
+          // (and not both multiples of 3) AND the match would leave
+          // part of the opener unused (closer shorter than opener):
+          // a longer closer consuming a short opener whole is fine
+          // (doc-04/27: `*uses state *callback*markdown**` pairs the
+          // `**` closer with the single-`*` opener; g14's single `*`
+          // closer against a `**` opener stays literal).
+          const useW = (o.len >= 2 && closer.len >= 2) ? 2 : 1;
+          const oddBarred = oddShadowed &&
+            (o.len + closer.len) % 3 === 0 &&
+            !(o.len % 3 === 0 && closer.len % 3 === 0) &&
+            useW < o.len;
+          if ((shadowed || oddBarred) && useW === 1) { oi--; continue; }
           opener = o;
           break;
         }
@@ -1346,7 +1499,19 @@ function parseInline(s, refs) {
       // the tags already on the opener; its close tag goes after them.
       parts[opener.part] = opener.ch.repeat(opener.len - use) + '<' + tag + '>' + opener.openTags;
       opener.openTags = '<' + tag + '>' + opener.openTags;
-      parts[closer.part] = closer.closeTags + '</' + tag + '>' + closer.ch.repeat(closer.len - use);
+      // A strong match formed past an odd-block (a both-open-and-close
+      // delimiter was consumed as a closer in between) takes its
+      // delimiters from the END of the closer run, so the run's leftover
+      // stars sit INSIDE the strong, before the close tag (k4/k5/l2/l4:
+      // `**a *b*c***` -> `<strong>a <em>b</em>c*</strong>`); otherwise
+      // the leftover stars follow the close tag (j1: `**a***` ->
+      // `<strong>a</strong>*`). Em matches always leave the leftover
+      // after the close tag (l1/l3).
+      if (use === 2 && oddShadowed && closer.len > use) {
+        parts[closer.part] = closer.closeTags + closer.ch.repeat(closer.len - use) + '</' + tag + '>';
+      } else {
+        parts[closer.part] = closer.closeTags + '</' + tag + '>' + closer.ch.repeat(closer.len - use);
+      }
       closer.closeTags = closer.closeTags + '</' + tag + '>';
       opener.len -= use;
       closer.len -= use;
@@ -1357,6 +1522,19 @@ function parseInline(s, refs) {
       // `*a b**c**d*` do emphasise).
       if (use === 2 && closer.canOpen && closer.canClose && opener.canOpen && !opener.canClose) {
         closer.blocking = true;
+      }
+      // A closer that can both open and close leaves an odd-block behind
+      // when it is consumed: a later closer of the same char cannot form
+      // a ONE-delimiter (em) match with an opener that lies before it
+      // when the sum of the two lengths is a multiple of 3 (marked:
+      // `**a *b*c* d**` -> strong, the lone `*` after c stays literal,
+      // while `**a *b* c* d**` -> em nesting, the lone `*` pairs).
+      // The block is per-char, persists across later closers, and does
+      // not bar a two-delimiter (strong) match past it; it also does
+      // not apply when the sum is not a multiple of 3 (g13: `*a *b*c*
+      // d*` pairs the lone `*` with the single-`*` opener, sum 2).
+      if (closer.canOpen && closer.canClose) {
+        closer.oddBlocking = true;
       }
       spans.push([oi, ci]);
       if (opener.len === 0) opener.active = false;
@@ -1493,6 +1671,59 @@ function parseInline(s, refs) {
     return { label, end: k + 1 };
   }
 
+  // A link label whose code spans have an ODD count of "bad" spans does
+  // not form a link in marked. A bad span is a code span whose content
+  // itself contains a backtick AND that is followed by more text before
+  // the closing ']' (m2/m3/n2/n3/o2-o4/o8/o11/o13/p2: one bad span ->
+  // no link; o12/p5/p6/p7: two bad spans -> link forms; n6: a bad span
+  // at the very end of the label is not bad -> link forms; m1/m4/n4:
+  // clean spans never count). The label's brackets stay literal and the
+  // destination becomes an autolink instead. (Escaped backticks do not
+  // start spans.)
+  // A link label forms no link in marked when (bad spans + unclosed
+  // backtick runs) is ODD. A bad span is a code span whose content
+  // itself contains a backtick AND that is followed by more text before
+  // the closing ']' (m2/m3/n2/n3/o2-o4/o8/o11/o13/p2: one bad span ->
+  // no link; o12/p5/p6/p7: two bad spans -> link forms; n6: a span at
+  // the very end of the label is not bad). An unclosed run is a backtick
+  // run left without a matching closer of the same length in the label
+  // (q3/q4/q5: one unclosed run -> no link; q2: two unclosed runs ->
+  // link forms; q1/q6: none -> link forms). Runs inside a formed span's
+  // content do not count separately. (Escaped backticks do not start
+  // spans.) When the count is odd the label's brackets stay literal and
+  // the destination becomes an autolink instead.
+  function labelBadCodeSpanParity(label) {
+    const n = label.length;
+    const runs = [];
+    let p = 0;
+    while (p < n) {
+      if (label[p] === '\\' && p + 1 < n) { p += 2; continue; }
+      if (label[p] !== '`') { p++; continue; }
+      let q = p;
+      while (q < n && label[q] === '`') q++;
+      runs.push({ start: p, len: q - p });
+      p = q;
+    }
+    let bad = 0;
+    const open = [];
+    for (const r of runs) {
+      let oi = -1;
+      for (let k = open.length - 1; k >= 0; k--) {
+        if (open[k].len === r.len) { oi = k; break; }
+      }
+      if (oi === -1) { open.push(r); continue; }
+      const o = open[oi];
+      let hasTick = false;
+      for (let t = o.start + o.len; t < r.start; t++) {
+        if (label[t] === '\\' && t + 1 < r.start) { t++; continue; }
+        if (label[t] === '`') { hasTick = true; break; }
+      }
+      if (hasTick && r.start + r.len < n) bad++;
+      open.length = oi;
+    }
+    return ((bad + open.length) % 2) === 1;
+  }
+
   // Try to resolve a link at the ']' at position i. Returns the new index
   // (position after the link) or -1 when no link formed.
   function tryLink(i) {
@@ -1522,6 +1753,12 @@ function parseInline(s, refs) {
       }
       return -1;
     };
+    // a label with an odd count of bad code spans forms no link at all
+    // (inline, full/collapsed reference, or shortcut alike — n9)
+    const labelText = s.slice(br.pos + 1, i);
+    if (labelText.indexOf('`') !== -1 && labelBadCodeSpanParity(labelText)) {
+      return fail();
+    }
     if (s[j] === '(') {
       const parsed = parseInlineLink(j);
       if (parsed) {
@@ -1760,6 +1997,79 @@ function parseInline(s, refs) {
     for (let k = brackets.length - 1; k >= 0; k--) if (brackets[k].active) return true;
     return false;
   }
+  // Find the ']' that closes bracket br (or -1): scan forward tracking
+  // nesting depth, skipping escaped chars and code spans (a ']' inside a
+  // code span never closes a bracket). excludePos: a backtick run starting
+  // here is NOT a span opener (it is the run currently being decided on);
+  // its run is skipped as literal text, so the ']' it would swallow is
+  // still found.
+  function findBracketClose(br, excludePos) {
+    let depth = 1;
+    let p = br.pos + 1;
+    while (p < n) {
+      const ch = s[p];
+      if (ch === '\\' && p + 1 < n && ASCII_PUNCT.has(s[p + 1])) { p += 2; continue; }
+      if (ch === '`') {
+        let q = p;
+        while (q < n && s[q] === '`') q++;
+        if (p === excludePos) { p = q; continue; }
+        const len = q - p;
+        let k = q;
+        let found = -1;
+        while (k < n) {
+          if (s[k] === '`') {
+            let e = k;
+            while (e < n && s[e] === '`') e++;
+            if (e - k === len) { found = k; break; }
+            k = e;
+          } else k++;
+        }
+        p = found === -1 ? q : found + len;
+        continue;
+      }
+      if (ch === '[') { depth++; p++; continue; }
+      if (ch === ']') {
+        depth--;
+        if (depth === 0) return p;
+        p++; continue;
+      }
+      p++;
+    }
+    return -1;
+  }
+  // Will bracket br form a link when its ']' is reached? Mirrors
+  // tryLink's decision (parity, inline dest, full/collapsed/shortcut
+  // reference) without mutating any state, so it can be asked early.
+  // closePos may be supplied (the ']' position, e.g. found excluding the
+  // run currently being decided on); otherwise it is located first.
+  function bracketWillForm(br, closePos) {
+    if (closePos === undefined) closePos = findBracketClose(br, -1);
+    if (closePos === -1) return false;
+    const labelText = s.slice(br.pos + 1, closePos);
+    if (labelText.indexOf('`') !== -1 && labelBadCodeSpanParity(labelText)) return false;
+    const j = closePos + 1;
+    if (s[j] === '(') {
+      if (parseInlineLink(j)) return true;
+      // a failed inline link falls back to a shortcut reference (cm-568)
+    } else if (s[j] === '[') {
+      const lab = parseLabel(j);
+      if (!lab) return false;
+      if (lab.label === '') return !!refs.get(normalizeLabel(labelText));
+      return !!refs.get(normalizeLabel(lab.label));
+    }
+    if (br.noShortcut) return false;
+    return !!refs.get(normalizeLabel(labelText));
+  }
+  // An extended autolink (or email) inside link text is suppressed only
+  // when an enclosing bracket will actually form a link (w1). When every
+  // enclosing bracket fails (w2/w3/w4, doc-39: the reference does not
+  // exist), the brackets are literal text and the autolink forms.
+  function enclosingLinkWillForm() {
+    for (let k = brackets.length - 1; k >= 0; k--) {
+      if (brackets[k].active && bracketWillForm(brackets[k])) return true;
+    }
+    return false;
+  }
 
   while (i < n) {
     const c = s.charCodeAt(i);
@@ -1811,6 +2121,25 @@ function parseInline(s, refs) {
         } else k++;
       }
       if (found === -1) { pushText(s.slice(i, j)); i = j; continue; }
+      // A code span opener inside a link label must not swallow the
+      // label's closing ']' when the bracket will form a link (doc-28:
+      // `[issue read two ``small`](...)` — the single backtick after
+      // `small` would close at a backtick on a later line, swallowing
+      // the ']' and breaking the link; marked forms the link with the
+      // backticks literal). Only block when the bracket WILL form: when
+      // it will not (no reference / bad parity), the span may cross the
+      // ']' as literal text (that is why the unconditional bracket-scope
+      // limits regressed cm-links/doc-36). The closer search excludes
+      // this run, so the ']' it would swallow is still found.
+      if (brackets.length > 0) {
+        const br = brackets[brackets.length - 1];
+        if (br.active) {
+          const closePos = findBracketClose(br, i);
+          if (closePos !== -1 && found > closePos && bracketWillForm(br, closePos)) {
+            pushText(s.slice(i, j)); i = j; continue;
+          }
+        }
+      }
       let content = s.slice(j, found).replace(/\n/g, ' ');
       if (content.length >= 2 && content[0] === ' ' && content[content.length - 1] === ' ' && /[^ ]/.test(content)) {
         content = content.slice(1, -1);
@@ -1931,7 +2260,7 @@ function parseInline(s, refs) {
     }
     // GFM extended autolinks: www. / http(s):// (scheme case-insensitive)
     if (c === 119 || c === 104 || c === 87 || c === 72) {
-      if (!inLinkText() && !inLinkRaw) {
+      if (!inLinkRaw && !enclosingLinkWillForm()) {
         const ext = parseExtAutolink(i);
         if (ext) {
           parts.push('<a href="' + normalizeHref(ext.href) + '">');
@@ -1944,7 +2273,7 @@ function parseInline(s, refs) {
     }
     // email autolink at '@'
     if (c === 64) {
-      if (!inLinkText() && !inLinkRaw) {
+      if (!inLinkRaw && !enclosingLinkWillForm()) {
         const em = parseEmailAt(i);
         if (em) {
           trimChars(parts, i - em.start);
@@ -2016,7 +2345,14 @@ function renderBlock(node, refs, out, tight) {
     }
     case 'html': {
       let content = node.lines.map(l => l + '\n').join('');
-      if ((node.endsAtBlank || node.noTrailingNewline || node.cutOff) && content.endsWith('\n')) content = content.slice(0, -1);
+      // An HTML block that is the last child of a blockquote or list item
+      // has no trailing newline (f1/f3/f4, e3/e7/e8, doc-30): the closing
+      // tag (</blockquote> / </li>) follows it directly. At top level
+      // (f5) and when another block follows (f2) the newline stays.
+      const parent = node.parent;
+      const lastInContainer = parent && parent.t !== 'doc' &&
+        parent.children[parent.children.length - 1] === node;
+      if ((node.endsAtBlank || node.noTrailingNewline || node.cutOff || lastInContainer) && content.endsWith('\n')) content = content.slice(0, -1);
       out.push(renderRawHtml(content));
       break;
     }
