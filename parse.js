@@ -228,8 +228,13 @@ function normalizeLabel(label) {
 // A line is read with a column-aware cursor so tabs behave per the spec:
 // a tab advances to the next multiple of 4 columns, and when only part of a
 // tab is consumed as indentation the rest stays a literal tab in the content.
+// `innerBase` is the width of the innermost BLOCKQUOTE marker stripped from
+// this line (2 for '> ') — a TAB inside fenced code in a blockquote expands
+// from this base, not from the accumulated column (marked behaves as if only
+// the innermost '> ' counted: a TAB in nested '> > ' expands like one in a
+// single '> '). It is set only for blockquotes; lists keep the old column.
 function makeLine(text) {
-  return { text, pos: 0, col: 0, partialTab: 0 };
+  return { text, pos: 0, col: 0, partialTab: 0, innerBase: 0 };
 }
 function lineChar(ln) {
   return ln.pos < ln.text.length ? ln.text[ln.pos] : '\n';
@@ -408,11 +413,14 @@ function parseBlocks(src) {
           // one optional space after '>'; a tab counts as one column here.
           // The space is only consumed when more content follows it: a
           // trailing space is content for the paragraph (cm-241)
+          let markerW = 1;
           if (ln.pos < ln.text.length) {
             const ch = ln.text.charCodeAt(ln.pos);
-            if (ch === 32 && ln.pos + 1 < ln.text.length) { ln.pos++; ln.col++; }
-            else if (ch === 9) { const w = 4 - (ln.col % 4); ln.partialTab = w - 1; ln.col += 1; }
+            if (ch === 32 && ln.pos + 1 < ln.text.length) { ln.pos++; ln.col++; markerW = 2; }
+            else if (ch === 9) { const w = 4 - (ln.col % 4); ln.partialTab = w - 1; ln.col += 1; markerW = 2; }
           }
+          // the innermost blockquote's own marker width is the TAB base
+          ln.innerBase = markerW;
           container = c;
           continue;
         }
@@ -421,11 +429,14 @@ function parseBlocks(src) {
         failAt = c;
         break;
       } else if (c.t === 'item') {
-        if (lineIsBlank(ln)) { container = c; continue; }
+        if (lineIsBlank(ln)) { ln.innerBase = 0; container = c; continue; }
         // an empty item cannot take content after a blank line
         if (c.children.length === 0 && lastLineBlank) { allMatched = false; failAt = c; break; }
         if (lineIndent(ln) >= c.indent) {
           lineAdvance(ln, c.indent);
+          // the innermost container is now a list item, not a blockquote,
+          // so the TAB base falls back to the accumulated column
+          ln.innerBase = 0;
           container = c;
           continue;
         }
@@ -894,25 +905,10 @@ function parseBlocks(src) {
         i += 2; continue;
       }
       if (c === '`') {
-        let k = i;
-        while (k < n && line[k] === '`') k++;
-        const run = k - i;
-        let m = k;
-        let found = -1;
-        while (m < n) {
-          if (line[m] === '`') {
-            let e = m;
-            while (e < n && line[e] === '`') e++;
-            if (e - m === run) { found = m; break; }
-            m = e;
-          } else m++;
-        }
-        if (found !== -1) {
-          // \| inside a code span is a literal pipe too (gfm-200)
-          cur += line.slice(i, found + run).replace(/(?<!\\)\\\|/g, '|');
-          i = found + run;
-        }
-        else { cur += line.slice(i, k); i = k; }
+        // marked does NOT protect '|' inside code spans when splitting
+        // table cells (tc1/tc2/tc5: `x | y` splits; only \| is exempt).
+        // A backtick is just an ordinary character here.
+        cur += c; i++;
         continue;
       }
       if (c === '|') {
@@ -1031,21 +1027,27 @@ function parseBlocks(src) {
         }
       }
       if (ok) { finalize(open.pop()); lastLineBlank = false; continue; }
-      // content lines lose up to the opening fence's indentation. A tab
-      // at the very start of the content: if the strip reaches it, the
-      // whole tab is removed; else if its column is > 0 it expands to
-      // spaces to the next multiple of 4; at column 0 it stays a tab.
-      // A tab after leading spaces stays a literal tab.
+      // content lines lose up to the opening fence's indentation — but
+      // only for BACKTICK fences. Marked does NOT strip the fence indent
+      // from a TILDE fence's content (probed b1–b6: ``` indented 2 strips
+      // 2, ~~~ indented 2 strips 0, in and out of blockquotes).
       let content = lineRest(ln);
-      let strip = t.fenceIndent || 0;
-      let col = ln.col;
+      let strip = t.fence === '`' ? (t.fenceIndent || 0) : 0;
+      const qBase = ln.innerBase || 0;
+      const col = qBase > 0 ? qBase : ln.col;
       if (content.charCodeAt(0) === 9) {
         if (strip > 0) { content = content.slice(1); strip = 0; }
         else if (col > 0) { content = ' '.repeat(4 - (col % 4)) + content.slice(1); }
       } else {
-        let ci = 0;
-        while (strip > 0 && ci < content.length && content.charCodeAt(ci) === 32) { ci++; strip--; }
-        content = content.slice(ci);
+        let totalSpaces = 0;
+        while (totalSpaces < content.length && content.charCodeAt(totalSpaces) === 32) totalSpaces++;
+        const stripN = Math.min(strip, totalSpaces);
+        if (qBase > 0 && totalSpaces < content.length && content.charCodeAt(totalSpaces) === 9) {
+          const tcol = qBase + totalSpaces;
+          content = ' '.repeat(totalSpaces - stripN) + ' '.repeat(4 - (tcol % 4)) + content.slice(totalSpaces + 1);
+        } else {
+          content = content.slice(stripN);
+        }
       }
       t.lines.push(content);
       lastLineBlank = false;
@@ -1171,17 +1173,23 @@ function parseBlocks(src) {
       if (tryIndentedCode(ln, cur)) break;
       if (tryBlockquote(ln, cur)) { cur = tip(); continue; }
       if (tip().t === 'para') {
-        let text = lineRest(ln);
         // a lazy continuation line inside a blockquote or list item loses
-        // its leading whitespace (cm-238, cm-291); a matched or top-level
-        // line keeps it (cm-049, cm-113, cm-222, cm-223, cm-241, cm-649)
+        // up to 4 columns of leading whitespace (the indented-code
+        // indent) when it has 4 or more; fewer than 4 columns are kept
+        // whole (cm-238, cm-291 strip 4; doc-29 / l1 / o1 keep 1–3).
+        // A matched or top-level line keeps it all (cm-049, cm-113,
+        // cm-222, cm-223, cm-241, cm-649).
         if (!allMatched) {
           let anc = tip().parent;
           while (anc) {
-            if (anc.t === 'quote' || anc.t === 'item') { text = text.replace(/^[ \t]+/, ''); break; }
+            if (anc.t === 'quote' || anc.t === 'item') {
+              if (lineIndent(ln) >= 4) lineAdvance(ln, 4);
+              break;
+            }
             anc = anc.parent;
           }
         }
+        let text = lineRest(ln);
         // a setext underline cannot be a lazy continuation inside a
         // blockquote or list item: it joins the paragraph indented four
         // spaces (cm-093)
@@ -1270,6 +1278,14 @@ function trailingSpaceCols(s, i) {
   return cols;
 }
 
+// Document-level flag: once an unclosed <a> tag appears in a paragraph's
+// inline content, GFM extended autolinks (email + http/www) are suppressed
+// for the rest of the document (doc-03). A </a> tag re-enables them.
+// Reset at the start of every parse() call. HTML blocks do not touch it
+// (they never go through parseInline), and regular links / angle autolinks
+// are unaffected by it.
+let inLinkRaw = false;
+
 function parseInline(s, refs) {
   const parts = [];
   const delims = [];
@@ -1291,8 +1307,14 @@ function parseInline(s, refs) {
       if (!closer.active || !closer.canClose) { ci++; continue; }
       let oi = ci - 1;
       let opener = null;
+      let shadowed = false;
       while (oi >= 0) {
         const o = delims[oi];
+        // A strong closer that stayed behind (see below) bars a later
+        // closer of the same char from a one-delimiter match with an
+        // earlier opener; a two-delimiter (strong) match may still form
+        // past it, so keep searching instead of failing outright.
+        if (o.ch === closer.ch && o.blocking) { shadowed = true; oi--; continue; }
         // Odd-match rule: if either delimiter can both open and close,
         // the sum of the lengths must not be a multiple of 3, unless both
         // lengths are multiples of 3 (cm-416, cm-417).
@@ -1309,6 +1331,9 @@ function parseInline(s, refs) {
           }
         }
         if (o.active && o.ch === closer.ch && o.canOpen && !blocked) {
+          // past a blocking closer, only a strong (two-delimiter) match
+          // may still form; a one-delimiter match is barred
+          if (shadowed && !(o.len >= 2 && closer.len >= 2)) { oi--; continue; }
           opener = o;
           break;
         }
@@ -1325,6 +1350,14 @@ function parseInline(s, refs) {
       closer.closeTags = closer.closeTags + '</' + tag + '>';
       opener.len -= use;
       closer.len -= use;
+      // A strong whose opener could only open and whose closer could both
+      // open and close leaves its closer behind as a block: a later closer
+      // of the same char cannot reach past it to an earlier opener (marked
+      // leaves `*a **b**c*` un-emphasised while `*a **b** c*` and
+      // `*a b**c**d*` do emphasise).
+      if (use === 2 && closer.canOpen && closer.canClose && opener.canOpen && !opener.canClose) {
+        closer.blocking = true;
+      }
       spans.push([oi, ci]);
       if (opener.len === 0) opener.active = false;
       if (closer.len === 0) { closer.active = false; ci++; }
@@ -1576,7 +1609,7 @@ function parseInline(s, refs) {
       // trimExtUrl strips trailing punctuation afterwards (but not '\')
       const m = /^www\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*(?:\.[A-Za-z]{2,})(?:[^\s<]*)?/.exec(s.slice(i));
       if (m) {
-        let url = trimExtUrl(m[0]);
+        let url = trimExtUrl(truncateUnmatchedParen(m[0]));
         if (url) return { href: 'http://' + url, text: url, len: url.length };
       }
       return null;
@@ -1585,7 +1618,7 @@ function parseInline(s, refs) {
     if (/^https?:\/\//i.test(s.slice(i, i + 8))) {
       const m = /^https?:\/\/[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*(?:\.[A-Za-z]{2,})?(?::\d+)?(?:[^\s<]*)?/i.exec(s.slice(i));
       if (m) {
-        let url = trimExtUrl(m[0]);
+        let url = trimExtUrl(truncateUnmatchedParen(m[0]));
         if (url) return { href: url, text: url, len: url.length };
       }
       return null;
@@ -1593,20 +1626,25 @@ function parseInline(s, refs) {
     return null;
   }
   // Strip trailing punctuation from an extended autolink per GFM rules.
+  // ']' and '}' are NOT trailing punctuation (u12/tr1: they stay in the
+  // URL); only ? ! . , : ; * _ ~ and quotes are stripped, plus a trailing
+  // ')' when it has no matching '(' (depth floored at 0, so an unmatched
+  // ')' earlier in the URL does not make a matched final ')' drop: m6).
   function trimExtUrl(url) {
     // drop trailing ? ! . , : ; * _ ~ and quotes
     let end = url.length;
-    while (end > 0 && '?!,.:;*_~"\' )]}'.indexOf(url[end - 1]) !== -1) {
+    while (end > 0 && '?!,.:;*_~"\' )'.indexOf(url[end - 1]) !== -1) {
       const ch = url[end - 1];
       if (ch === ')') {
-        // keep only if parens are balanced
+        // keep only if parens are balanced (depth over the URL without
+        // this ')', floored at 0, must be > 0)
         let depth = 0;
-        for (let k = 0; k < end; k++) {
+        for (let k = 0; k < end - 1; k++) {
           if (url[k] === '(') depth++;
-          else if (url[k] === ')') depth--;
+          else if (url[k] === ')' && depth > 0) depth--;
         }
-        if (depth < 0) { end--; continue; }
-        break;
+        if (depth > 0) break;
+        end--; continue;
       }
       if (ch === ';') {
         // a trailing entity reference is not part of the URL at all (gfm-627)
@@ -1618,6 +1656,18 @@ function parseInline(s, refs) {
       end--;
     }
     return url.slice(0, end);
+  }
+  // A '(' with no ')' after it in the URL ends the autolink there
+  // (u8/u9/m1: an unmatched '(' and everything after it is not part of
+  // the URL). A '(' that does have a ')' after it stays (u5/m6).
+  function truncateUnmatchedParen(url) {
+    let start = 0;
+    while (true) {
+      const open = url.indexOf('(', start);
+      if (open === -1) return url;
+      if (url.indexOf(')', open + 1) === -1) return url.slice(0, open);
+      start = open + 1;
+    }
   }
   // Email autolink when s[i] === '@': look back for the local part.
   // Returns {href, text, start, len} (start = local part's index) or null.
@@ -1804,7 +1854,7 @@ function parseInline(s, refs) {
           // inside its span shares its id (cm-519)
           linkId = brackets[b].id; break;
         }
-        delims.push({ ch, len, canOpen, canClose, part: parts.length - 1, active: true, openTags: '', closeTags: '', linkId });
+        delims.push({ ch, len, canOpen, canClose, part: parts.length - 1, active: true, openTags: '', closeTags: '', linkId, blocking: false });
       }
       i = j;
       continue;
@@ -1847,6 +1897,18 @@ function parseInline(s, refs) {
       if (tag) {
         // marked does not filter disallowed tags (gfm-657): emit raw
         parts.push(tag);
+        // an <a> tag suppresses extended autolinks for the rest of the
+        // document; </a> re-enables them. The check is exact (probed):
+        // open sets ONLY for '<a ' / '<A ' (a space after the tag name,
+        // i.e. an attributed anchor); bare '<a>', '<A>', '<a/>',
+        // '<a\t>' and '<a\nhref=...>' do NOT set. Close clears only for
+        // exactly '</a>' or '</A>' (no trailing space); '</a >',
+        // '</ab>' do not.
+        if ((tag[1] === 'a' || tag[1] === 'A') && tag[2] === ' ') {
+          inLinkRaw = true;
+        } else if (tag === '</a>' || tag === '</A>') {
+          inLinkRaw = false;
+        }
         i += tag.length;
         continue;
       }
@@ -1869,7 +1931,7 @@ function parseInline(s, refs) {
     }
     // GFM extended autolinks: www. / http(s):// (scheme case-insensitive)
     if (c === 119 || c === 104 || c === 87 || c === 72) {
-      if (!inLinkText()) {
+      if (!inLinkText() && !inLinkRaw) {
         const ext = parseExtAutolink(i);
         if (ext) {
           parts.push('<a href="' + normalizeHref(ext.href) + '">');
@@ -1882,7 +1944,7 @@ function parseInline(s, refs) {
     }
     // email autolink at '@'
     if (c === 64) {
-      if (!inLinkText()) {
+      if (!inLinkText() && !inLinkRaw) {
         const em = parseEmailAt(i);
         if (em) {
           trimChars(parts, i - em.start);
@@ -2064,6 +2126,7 @@ function taskInfo(text) {
 
 // ---- entry point -----------------------------------------------------------
 export function parse(markdown) {
+  inLinkRaw = false;
   const { root, refs } = parseBlocks(markdown);
   const out = [];
   renderBlock(root, refs, out, false);
