@@ -1430,6 +1430,16 @@ function parseInline(s, refs) {
   let i = 0;
   let linkIdCounter = 0;
   const labelStarts = new Set();
+  // Backtick runs blocked inside a forming link's label (their code span
+  // would swallow the label's ']'): {pos, len} in source order. They pair
+  // with the next same-length run after them (the phantom code span).
+  const blockedRuns = [];
+  // Code spans whose content contains a backtick ("bad" spans): {start,
+  // end} source positions. An emphasis span inside a link label that
+  // encloses a bad span does not form in marked (doc-16/20/23: the
+  // `_..._` around `` `` a ` b `` `` stays literal inside the label,
+  // while the same emphasis forms outside a label, n5/n6/n8).
+  const badCodeSpans = [];
 
   function pushText(str) { escapeText(str, parts); }
 
@@ -1465,7 +1475,17 @@ function parseInline(s, refs) {
         // A closer cannot match an opener across a link boundary: the two
         // must sit inside the same bracket (or both outside) (cm-473).
         // Nor may the new span cross one already formed (cm-469, cm-470).
+        // Inside a link label, an emphasis that encloses a bad code span
+        // (content contains a backtick) does not form (doc-16/20/23);
+        // outside a label the same emphasis does form (n5/n6/n8).
+        // inBracket is the bracket id at push time (linkId is reset when
+        // a label fails to form a link, so it cannot be used here).
         let blocked = oddBlocked || o.linkId !== closer.linkId;
+        if (!blocked && o.inBracket !== 0 && o.inBracket === closer.inBracket) {
+          for (const bs of badCodeSpans) {
+            if (bs.start > o.pos && bs.end <= closer.pos) { blocked = true; break; }
+          }
+        }
         if (!blocked) {
           for (const [a, b] of spans) {
             if ((a < oi && oi < b && b < ci) || (oi < a && a < ci && ci < b)) { blocked = true; break; }
@@ -2000,9 +2020,12 @@ function parseInline(s, refs) {
   // Find the ']' that closes bracket br (or -1): scan forward tracking
   // nesting depth, skipping escaped chars and code spans (a ']' inside a
   // code span never closes a bracket). excludePos: a backtick run starting
-  // here is NOT a span opener (it is the run currently being decided on);
-  // its run is skipped as literal text, so the ']' it would swallow is
-  // still found.
+  // at or after here is NOT a span opener (it is the run currently being
+  // decided on, or a later run whose span-ness is undecided); its run is
+  // skipped as literal text, so the ']' it would swallow is still found.
+  // Only runs starting before excludePos are real spans (already decided)
+  // and get skipped to their closer. With excludePos -1 (the autolink
+  // look-ahead) every run is a potential opener, as before.
   function findBracketClose(br, excludePos) {
     let depth = 1;
     let p = br.pos + 1;
@@ -2012,8 +2035,16 @@ function parseInline(s, refs) {
       if (ch === '`') {
         let q = p;
         while (q < n && s[q] === '`') q++;
-        if (p === excludePos) { p = q; continue; }
+        if (excludePos !== -1 && p >= excludePos) { p = q; continue; }
         const len = q - p;
+        // A run already blocked (pushed as literal) is not a code span
+        // opener: it must not swallow the ']' (doc-09: the `` `` `` in
+        // the label was blocked, but findBracketClose for the later `` ` ``
+        // treated it as an opener whose closer sits past the ']', so the
+        // ']' was skipped and the `` ` `` formed a span with `deno`).
+        let isBlocked = false;
+        for (const b2 of blockedRuns) { if (b2.pos === p) { isBlocked = true; break; } }
+        if (isBlocked) { p = q; continue; }
         let k = q;
         let found = -1;
         while (k < n) {
@@ -2136,6 +2167,7 @@ function parseInline(s, refs) {
         if (br.active) {
           const closePos = findBracketClose(br, i);
           if (closePos !== -1 && found > closePos && bracketWillForm(br, closePos)) {
+            blockedRuns.push({ pos: i, len: run });
             pushText(s.slice(i, j)); i = j; continue;
           }
         }
@@ -2144,6 +2176,7 @@ function parseInline(s, refs) {
       if (content.length >= 2 && content[0] === ' ' && content[content.length - 1] === ' ' && /[^ ]/.test(content)) {
         content = content.slice(1, -1);
       }
+      if (s.slice(j, found).indexOf('`') !== -1) badCodeSpans.push({ start: i, end: found + run });
       parts.push('<code>');
       escapeText(content, parts);
       parts.push('</code>');
@@ -2183,7 +2216,7 @@ function parseInline(s, refs) {
           // inside its span shares its id (cm-519)
           linkId = brackets[b].id; break;
         }
-        delims.push({ ch, len, canOpen, canClose, part: parts.length - 1, active: true, openTags: '', closeTags: '', linkId, blocking: false });
+        delims.push({ ch, len, canOpen, canClose, part: parts.length - 1, pos: i, active: true, openTags: '', closeTags: '', linkId, inBracket: linkId, blocking: false });
       }
       i = j;
       continue;
@@ -2304,6 +2337,39 @@ function parseInline(s, refs) {
     }
     if (i > start) pushText(s.slice(start, i));
     else { pushText(s[i]); i++; }
+  }
+  // A backtick run blocked inside a forming link's label pairs with a
+  // later run of the same length (the "phantom" code span): any emphasis
+  // delimiter lying strictly between the two is literal in marked
+  // (i3/i4/i5, h4/h7/h10, k1/k3, doc-28/doc-09) — the emphasis cannot
+  // form across the phantom span. The span extends to the LAST
+  // same-length run in the paragraph, not the first: in doc-09 the
+  // label's len-1 run is followed by `deno` (a real code span, before
+  // the emphasis) AND `a ` b` (after it), and the emphasis is still
+  // blocked. A delimiter after the last same-length run (i1/i2), or
+  // with no later same-length run at all (j4), is unaffected.
+  // Deactivate such delimiters so they stay literal text.
+  for (const br of blockedRuns) {
+    let endPos = -1;
+    let p = br.pos + br.len;
+    while (p < n) {
+      if (s[p] === '`') {
+        let q = p;
+        while (q < n && s[q] === '`') q++;
+        if (q - p === br.len) endPos = p;
+        p = q;
+      } else p++;
+    }
+    if (endPos === -1) continue;
+    // Only emphasis outside any link label is blocked by the phantom
+    // span (doc-09/28: the emphasis sits after the link, in plain text).
+    // Emphasis inside a label is governed by the bad-code-span rule
+    // above, not by this one (doc-35: `*fast*` inside
+    // `[default run*fast*]` must still form even though an earlier
+    // label's blocked run has a later same-length run past it).
+    for (const d of delims) {
+      if (d.inBracket === 0 && d.pos > br.pos && d.pos < endPos) d.active = false;
+    }
   }
   resolveEmphasis();
   return parts.join('');
